@@ -1,0 +1,113 @@
+adı: RDP
+
+Açık:
+  iş akışı_dağıtımı:
+
+İşler:
+  güvenli-rdp:
+    runs-on: windows-latest
+    zaman aşımı süresi: 3600 dakika
+
+    Adımlar:
+      - ad: Temel RDP Ayarlarını Yapılandır
+        çalıştır: |
+          # Uzaktan Masaüstünü etkinleştirin ve Ağ Düzeyi Kimlik Doğrulamasını devre dışı bırakın (gerekirse)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Ad "fDenyTSConnections" -Değer 0 -Zorla
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Ad "Kullanıcı Kimlik Doğrulaması" -Değer 0 -Zorla
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Ad "SecurityLayer" -Değer 0 -Zorla
+
+          # Tekrarlamayı önlemek için aynı ada sahip mevcut tüm kuralları kaldırın.
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # Test amacıyla, 3389 numaralı porttan gelen tüm bağlantılara izin verin.
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # (İsteğe bağlı) Değişikliklerin geçerli olması için Uzak Masaüstü hizmetini yeniden başlatın.
+          Restart-Service -Name TermService -Force
+
+      - ad: Güvenli Parola ile RDP Kullanıcısı Oluştur
+        çalıştır: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper = [char[]](65..90) # AZ
+              Alt = [char[]](97..122) # az
+              Sayı = [char[]](48..57) # 0-9
+              Özel = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Özel karakterler
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=Kullanıcı: RDP | Şifre: $password" >> $env:GITHUB_ENV
+          
+          eğer (-not (Get-LocalUser -Name "RDP")) {
+              Yazma Hatası "Kullanıcı oluşturma başarısız oldu"
+              çıkış 1
+          }
+
+      - isim: Tailscale'i Yükle
+        çalıştır: |
+          $tsUrl = " https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi "
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - isim: Kuyruk Pul Bağlantısını Kurma
+        çalıştır: |
+          # Sağlanan kimlik doğrulama anahtarıyla Tailscale'i başlatın ve benzersiz bir ana bilgisayar adı belirleyin.
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          # Tailscale'in bir IP adresi atamasını bekleyin
+          $tsIP = $null
+          $yeniden deneme = 0
+          (-not $tsIP -and $retries -lt 10) koşulu sağlandığı sürece {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Başlat-Uyku -5 Saniye
+              $yeniden denemeler++
+          }
+          
+          eğer (-not $tsIP) {
+              Yazma Hatası: "Tailscale IP adresi atanmadı. Çıkılıyor."
+              çıkış 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - ad: RDP Erişilebilirliğini Doğrula
+        çalıştır: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          
+          # Tailscale IP adresine 3389 numaralı port üzerinden Test-NetConnection komutuyla bağlantıyı test edin.
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          eğer (-not $testReult.TcpTestSucceeded) {
+              Yazma Hatası "3389 numaralı RDP portuna TCP bağlantısı başarısız oldu"
+              çıkış 1
+          }
+          Write-Host "TCP bağlantısı başarılı!"
+
+      - isim: Bağlantıyı Sürdür
+        çalıştır: |
+          Write-Host "`n=== RDP ERİŞİMİ ==="
+          Write-Host "Adres: $env:TAILSCALE_IP"
+          Write-Host "Kullanıcı adı: RDP"
+          Write-Host "Şifre: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Çalıştırıcıyı süresiz olarak (veya manuel olarak iptal edilene kadar) aktif tutun.
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Etkin - Sonlandırmak için iş akışında Ctrl+C kullanın"
+              Başlat-Uyku -300 Saniye
+          }
